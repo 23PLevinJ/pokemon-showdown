@@ -1009,8 +1009,7 @@ export class Battle {
 				// Pokemon speeds including ties are resolved before all onSwitchIn handlers and aren't re-sorted in-between
 				// so we subtract a fractional speed from each Pokemon's respective event handlers by using the index of their
 				// unique field position in a pre-sorted-by-speed array
-				const fieldPositionValue = pokemon.side.n * this.sides.length + pokemon.position;
-				handler.speed -= this.speedOrder.indexOf(fieldPositionValue) / (this.activePerHalf * 2);
+				handler.speed -= this.speedOrder.indexOf(pokemon.getFieldPositionValue()) / (this.activePerHalf * 2);
 			}
 		}
 		return handler;
@@ -1296,6 +1295,39 @@ export class Battle {
 			return false;
 		}
 		return !!move.flags['contact'];
+	}
+
+	skillSwap(source: Pokemon, target: Pokemon) {
+		if (source.fainted || target.fainted) return false;
+		if (source.volatiles['dynamax'] || target.volatiles['dynamax']) return false;
+		const sourceAbility = source.getAbility();
+		const targetAbility = target.getAbility();
+		if (sourceAbility.flags['failskillswap'] || targetAbility.flags['failskillswap']) return false;
+		if (this.gen <= 5 && sourceAbility.id === targetAbility.id) return false;
+
+		const sourceEffect = this.dex.conditions.get('skillswap');
+		const targetCanBeSet = this.runEvent('SetAbility', target, source, sourceEffect, sourceAbility);
+		if (!targetCanBeSet) return targetCanBeSet;
+		const sourceCanBeSet = this.runEvent('SetAbility', source, source, sourceEffect, targetAbility);
+		if (!sourceCanBeSet) return sourceCanBeSet;
+
+		if (this.gen <= 4 || source.isAlly(target)) {
+			this.add('-activate', source, 'Skill Swap');
+		} else {
+			this.add('-activate', source, 'Skill Swap', target, `[ability] ${targetAbility.name}`, `[ability2] ${sourceAbility.name}`);
+		}
+		this.singleEvent('End', sourceAbility, source.abilityState, source);
+		this.singleEvent('End', targetAbility, target.abilityState, target);
+		source.ability = targetAbility.id;
+		target.ability = sourceAbility.id;
+		source.abilityState = this.initEffectState({ id: toID(source.ability), target: source });
+		target.abilityState = this.initEffectState({ id: toID(target.ability), target });
+		source.volatileStaleness = undefined;
+		if (!source.isAlly(target)) target.volatileStaleness = 'external';
+		if (this.gen > 3) {
+			this.singleEvent('Start', sourceAbility, target.abilityState, target);
+			this.singleEvent('Start', targetAbility, source.abilityState, source);
+		}
 	}
 
 	getPokemon(fullname: string | Pokemon) {
@@ -1607,6 +1639,12 @@ export class Battle {
 						delete pokemon.volatiles['partiallytrapped'];
 					}
 				}
+				if (pokemon.volatiles['fakepartiallytrapped']) {
+					const counterpart = pokemon.volatiles['fakepartiallytrapped'].counterpart;
+					if (counterpart.hp <= 0 || !counterpart.volatiles['fakepartiallytrapped']) {
+						delete pokemon.volatiles['fakepartiallytrapped'];
+					}
+				}
 			}
 		}
 
@@ -1784,7 +1822,7 @@ export class Battle {
 		if (this.turn <= 100) return;
 
 		// the turn limit is not a part of Endless Battle Clause
-		if (this.turn >= 1000) {
+		if (this.turn > 1000) {
 			this.add('message', `It is turn 1000. You have hit the turn limit!`);
 			this.tie();
 			return true;
@@ -2089,7 +2127,7 @@ export class Battle {
 			const name = effect.fullname === 'tox' ? 'psn' : effect.fullname;
 			switch (effect.id) {
 			case 'partiallytrapped':
-				this.add('-damage', target, target.getHealth, '[from] ' + this.effectState.sourceEffect.fullname, '[partiallytrapped]');
+				this.add('-damage', target, target.getHealth, '[from] ' + target.volatiles['partiallytrapped'].sourceEffect.fullname, '[partiallytrapped]');
 				break;
 			case 'powder':
 				this.add('-damage', target, target.getHealth, '[silent]');
@@ -2308,37 +2346,31 @@ export class Battle {
 
 	/** Given a table of base stats and a pokemon set, return the actual stats. */
 	spreadModify(baseStats: StatsTable, set: PokemonSet): StatsTable {
-		const modStats: SparseStatsTable = { atk: 10, def: 10, spa: 10, spd: 10, spe: 10 };
-		const tr = this.trunc;
-		let statName: keyof StatsTable;
-		for (statName in modStats) {
-			const stat = baseStats[statName];
-			modStats[statName] = tr(tr(2 * stat + set.ivs[statName] + tr(set.evs[statName] / 4)) * set.level / 100 + 5);
+		const modStats: StatsTable = { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 };
+		for (const statName in baseStats) {
+			modStats[statName as StatID] = this.statModify(baseStats, set, statName as StatID);
 		}
-		if ('hp' in baseStats) {
-			const stat = baseStats['hp'];
-			modStats['hp'] = tr(tr(2 * stat + set.ivs['hp'] + tr(set.evs['hp'] / 4) + 100) * set.level / 100 + 10);
-		}
-		return this.natureModify(modStats as StatsTable, set);
+		return modStats;
 	}
 
-	natureModify(stats: StatsTable, set: PokemonSet): StatsTable {
+	statModify(baseStats: StatsTable, set: PokemonSet, statName: StatID): number {
+		const tr = this.trunc;
+		let stat = baseStats[statName];
+		if (statName === 'hp') {
+			return tr(tr(2 * stat + set.ivs[statName] + tr(set.evs[statName] / 4) + 100) * set.level / 100 + 10);
+		}
+		stat = tr(tr(2 * stat + set.ivs[statName] + tr(set.evs[statName] / 4)) * set.level / 100 + 5);
+		const nature = this.dex.natures.get(set.nature);
 		// Natures are calculated with 16-bit truncation.
 		// This only affects Eternatus-Eternamax in Pure Hackmons.
-		const tr = this.trunc;
-		const nature = this.dex.natures.get(set.nature);
-		let s: StatIDExceptHP;
-		if (nature.plus) {
-			s = nature.plus;
-			const stat = this.ruleTable.has('overflowstatmod') ? Math.min(stats[s], 595) : stats[s];
-			stats[s] = tr(tr(stat * 110, 16) / 100);
+		if (nature.plus === statName) {
+			stat = this.ruleTable.has('overflowstatmod') ? Math.min(stat, 595) : stat;
+			stat = tr(tr(stat * 110, 16) / 100);
+		} else if (nature.minus === statName) {
+			stat = this.ruleTable.has('overflowstatmod') ? Math.min(stat, 728) : stat;
+			stat = tr(tr(stat * 90, 16) / 100);
 		}
-		if (nature.minus) {
-			s = nature.minus;
-			const stat = this.ruleTable.has('overflowstatmod') ? Math.min(stats[s], 728) : stats[s];
-			stats[s] = tr(tr(stat * 90, 16) / 100);
-		}
-		return stats;
+		return stat;
 	}
 
 	finalModify(relayVar: number) {
@@ -2639,40 +2671,8 @@ export class Battle {
 
 			this.add('start');
 
-			// Change Zacian/Zamazenta into their Crowned formes
 			for (const pokemon of this.getAllPokemon()) {
-				let rawSpecies: Species | null = null;
-				if (pokemon.species.id === 'zacian' && pokemon.item === 'rustedsword') {
-					rawSpecies = this.dex.species.get('Zacian-Crowned');
-				} else if (pokemon.species.id === 'zamazenta' && pokemon.item === 'rustedshield') {
-					rawSpecies = this.dex.species.get('Zamazenta-Crowned');
-				}
-				if (!rawSpecies) continue;
-				const species = pokemon.setSpecies(rawSpecies);
-				if (!species) continue;
-				pokemon.baseSpecies = rawSpecies;
-				pokemon.details = pokemon.getUpdatedDetails();
-				pokemon.setAbility(species.abilities['0'], null, true);
-				pokemon.baseAbility = pokemon.ability;
-
-				const behemothMove: { [k: string]: string } = {
-					'Zacian-Crowned': 'behemothblade', 'Zamazenta-Crowned': 'behemothbash',
-				};
-				const ironHeadIndex = pokemon.baseMoves.indexOf('ironhead');
-				if (ironHeadIndex >= 0) {
-					const move = this.dex.moves.get(behemothMove[rawSpecies.name]);
-					pokemon.baseMoveSlots[ironHeadIndex] = {
-						move: move.name,
-						id: move.id,
-						pp: move.noPPBoosts ? move.pp : move.pp * 8 / 5,
-						maxpp: move.noPPBoosts ? move.pp : move.pp * 8 / 5,
-						target: move.target,
-						disabled: false,
-						disabledSource: '',
-						used: false,
-					};
-					pokemon.moveSlots = pokemon.baseMoveSlots.slice();
-				}
+				this.singleEvent('BattleStart', this.dex.conditions.getByID(pokemon.species.id), pokemon.speciesState, pokemon);
 			}
 
 			this.format.onBattleStart?.call(this);
@@ -2693,9 +2693,6 @@ export class Battle {
 						this.actions.switchIn(side.pokemon[i], i);
 					}
 				}
-			}
-			for (const pokemon of this.getAllPokemon()) {
-				this.singleEvent('Start', this.dex.conditions.getByID(pokemon.species.id), pokemon.speciesState, pokemon);
 			}
 			this.midTurn = true;
 			break;
@@ -3037,7 +3034,20 @@ export class Battle {
 			return;
 		}
 
+		let updated = false;
+		if (side.requestState === 'move') {
+			for (const action of side.choice.actions) {
+				const pokemon = action.pokemon;
+				if (action.choice !== 'move' || !pokemon) continue;
+				if (side.updateRequestForPokemon(pokemon, req => side.updateDisabledRequest(pokemon, req))) {
+					updated = true;
+				}
+			}
+		}
+
 		side.clearChoice();
+
+		if (updated) side.emitRequest(side.activeRequest!, true);
 	}
 
 	/**
@@ -3055,7 +3065,7 @@ export class Battle {
 	}
 
 	hint(hint: string, once?: boolean, side?: Side) {
-		if (this.hints.has(hint)) return;
+		if (this.hints.has(side ? `${side.id}|${hint}` : hint)) return;
 
 		if (side) {
 			this.addSplit(side.id, ['-hint', hint]);
@@ -3063,7 +3073,7 @@ export class Battle {
 			this.add('-hint', hint);
 		}
 
-		if (once) this.hints.add(hint);
+		if (once) this.hints.add(side ? `${side.id}|${hint}` : hint);
 	}
 
 	addSplit(side: SideID, secret: Part[], shared?: Part[]) {
@@ -3131,9 +3141,9 @@ export class Battle {
 		this.log[this.lastMoveLine] = parts.join('|');
 	}
 
-	debug(activity: string) {
+	debug(...activity: Part[]) {
 		if (this.debugMode) {
-			this.add('debug', activity);
+			this.add('debug', ...activity);
 		}
 	}
 
